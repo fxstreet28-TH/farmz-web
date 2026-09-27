@@ -11,6 +11,10 @@ body {
   min-height: 100%;
 }
 
+html {
+  background-color: #c1ea96;
+}
+
 body {
   background:
     radial-gradient(circle at 20% 0%, rgba(255, 255, 255, 0.7), transparent 40%),

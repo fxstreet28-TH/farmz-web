@@ -6,7 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { getAddress } from "viem";
 import { createSiweMessage } from "viem/siwe";
 import { useAccount, useSignMessage } from "wagmi";
-import { api, ApiError, refreshSession, setAuthHooks, type StoredSession } from "./api";
+import { api, ApiError, friendlyError, refreshSession, setAuthHooks, type StoredSession } from "./api";
 import { env } from "./env";
 
 const STORAGE_PREFIX = "farmz.session.";
@@ -137,7 +137,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       if (e instanceof ApiError) {
         setError(e.code === "SIWE_DOMAIN_NOT_ALLOWED"
           ? `Backend doesn't allow the domain "${window.location.host}" yet. Add it to SIWE_ALLOWED_DOMAINS.`
-          : e.code);
+          : friendlyError(e));
       } else if (e && typeof e === "object" && "name" in e && (e as Error).name === "UserRejectedRequestError") {
         setError("Signature request was cancelled");
       } else {

@@ -3,41 +3,70 @@
 import {
   AdaptiveDpr,
   Html,
-  OrbitControls,
+  KeyboardControls,
   PerformanceMonitor,
   Sky,
   useGLTF,
+  useKeyboardControls,
   useProgress,
+  type KeyboardControlsEntry,
 } from "@react-three/drei";
-import { Canvas } from "@react-three/fiber";
-import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Physics } from "@react-three/rapier";
+import { EcctrlJoystick } from "ecctrl-lib";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { MeshBasicMaterial } from "three";
 import { allModelUrls } from "@/config/assets";
-import { useFarmActions, animalStatus, cropStage } from "@/lib/farmActions";
+import { useFarmActions } from "@/lib/farmActions";
 import { emoji } from "@/lib/emoji";
 import { useConfig, useTick } from "@/lib/game";
+import { resolveFocus, triggerFocus, useInteractable, useInteraction } from "@/lib/interaction";
 import type { Animal, GameState, Plot } from "@/lib/types";
 import { useToast } from "../Toast";
 import { Animal3D } from "./Animal3D";
+import { Player } from "./Player";
 import { Plot3D, type HarvestFx } from "./Plot3D";
 import { Scenery } from "./Scenery";
 import { SoilTiles } from "./Soil";
-import { CameraRig } from "./CameraRig";
-import { CAMERA_TARGET, plotPosition } from "./layout";
+import { BOARD_POS, MARKET_POS, plotPosition } from "./layout";
+
+export type PanelTab = "missions" | "shop" | "wallet" | "barn";
 
 // Kick off model downloads as soon as this chunk loads (the scene itself is lazy-loaded).
 if (typeof window !== "undefined") allModelUrls().forEach((u) => useGLTF.preload(u));
 
+const KEYMAP: KeyboardControlsEntry<string>[] = [
+  { name: "forward", keys: ["ArrowUp", "KeyW"] },
+  { name: "backward", keys: ["ArrowDown", "KeyS"] },
+  { name: "leftward", keys: ["ArrowLeft", "KeyA"] },
+  { name: "rightward", keys: ["ArrowRight", "KeyD"] },
+  { name: "jump", keys: ["Space"] },
+  { name: "run", keys: ["Shift"] },
+  { name: "action1", keys: ["KeyE", "Enter"] }, // interact (also plays the "pick-up" animation)
+];
+
+// Farm-coloured joystick (ecctrl defaults to a rainbow normal material). Unlit: the joystick
+// renders in its own little canvas without scene lights.
+const joyMaterials = {
+  base: new MeshBasicMaterial({ color: "#ffffff", transparent: true, opacity: 0.45 }),
+  stick: new MeshBasicMaterial({ color: "#a97a4b" }),
+  handle: new MeshBasicMaterial({ color: "#ffcc22" }),
+};
+
+export function isTouchDevice() {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia?.("(pointer: coarse)").matches ?? false;
+}
+
 function detectLowEnd() {
   if (typeof window === "undefined") return false;
-  const coarse = window.matchMedia?.("(pointer: coarse)").matches ?? false;
   const small = window.innerWidth < 768;
   const cores = navigator.hardwareConcurrency ?? 8;
-  return (coarse && small) || cores <= 4;
+  return (isTouchDevice() && small) || cores <= 4;
 }
 
 function LoadingOverlay() {
-  const { active, progress } = useProgress();
-  if (!active) return null;
+  const { progress } = useProgress();
   return (
     <Html center>
       <div className="flex flex-col items-center gap-2 font-display font-extrabold text-grass-800">
@@ -50,84 +79,124 @@ function LoadingOverlay() {
   );
 }
 
+/** Re-evaluates the nearest interactable ~10×/s. */
+function FocusResolver() {
+  const acc = useRef(0);
+  useFrame((state, dt) => {
+    if (process.env.NODE_ENV !== "production") {
+      const w = window as unknown as { __farmz?: Record<string, unknown> };
+      if (w.__farmz) w.__farmz.camera = state.camera;
+    }
+    acc.current += dt;
+    if (acc.current < 0.1) return;
+    acc.current = 0;
+    resolveFocus();
+  });
+  useEffect(() => () => useInteraction.getState().setFocus(null, null), []);
+  return null;
+}
+
+/** E / Enter triggers the focused object's action. */
+function InteractKey() {
+  const [subscribe] = useKeyboardControls();
+  useEffect(
+    () =>
+      subscribe(
+        (s) => s.action1,
+        (pressed) => {
+          if (pressed) triggerFocus();
+        },
+      ),
+    [subscribe],
+  );
+  return null;
+}
+
+function Stations({ onOpenPanel }: { onOpenPanel: (t: PanelTab) => void }) {
+  useInteractable("station:market", {
+    pos: () => [MARKET_POS[0] - 1.3, MARKET_POS[2] + 0.2],
+    radius: 3,
+    prompt: () => ({ icon: "🛒", label: "Open Market", actionable: true }),
+    act: () => onOpenPanel("shop"),
+  });
+  useInteractable("station:board", {
+    pos: () => [BOARD_POS[0], BOARD_POS[2]],
+    radius: 2.4,
+    prompt: () => ({ icon: "📋", label: "Daily Missions & Orders", actionable: true }),
+    act: () => onOpenPanel("missions"),
+  });
+  return null;
+}
+
 function World({
   state,
   lowQuality,
   onEmptyPlot,
-  onNeedFeed,
+  onOpenPanel,
 }: {
   state: GameState;
   lowQuality: boolean;
   onEmptyPlot: (plot: Plot) => void;
-  onNeedFeed: (animal: Animal) => void;
+  onOpenPanel: (t: PanelTab) => void;
 }) {
   const now = useTick(1000);
   const { harvest, feed, collect, busy } = useFarmActions();
   const { data: config } = useConfig();
   const toast = useToast();
-  const [hovered, setHovered] = useState<string | null>(null);
   const [harvestFx, setHarvestFx] = useState<Record<string, HarvestFx>>({});
   const [animalFx, setAnimalFx] = useState<Record<string, string>>({});
 
   const positions = useMemo(() => state.plots.map((_, i) => plotPosition(i, state.plots.length)), [state.plots]);
-  const highlight = useMemo(() => {
-    const s = new Set<number>();
-    state.plots.forEach((p, i) => p.id === hovered && s.add(i));
-    return s;
-  }, [state.plots, hovered]);
-
-  const flashPlot = (id: string, fx: HarvestFx) => {
-    setHarvestFx((m) => ({ ...m, [id]: fx }));
-    setTimeout(() => setHarvestFx((m) => {
-      const n = { ...m };
-      delete n[id];
-      return n;
-    }), 1300);
-  };
-  const flashAnimal = (id: string, label: string) => {
-    setAnimalFx((m) => ({ ...m, [id]: label }));
-    setTimeout(() => setAnimalFx((m) => {
-      const n = { ...m };
-      delete n[id];
-      return n;
-    }), 1200);
-  };
-
-  const selectPlot = useCallback(
-    async (plot: Plot) => {
-      if (plot.state === "empty") return onEmptyPlot(plot);
-      // Growing or ready: always ask the server. It answers NOT_READY if the timer isn't done.
-      const cropId = plot.crop_id ?? "";
-      const r = await harvest(plot);
-      if (r) flashPlot(plot.id, { cropId, label: `+${r.qty} ${emoji(r.item)}`, at: Date.now() });
-    },
-    [harvest, onEmptyPlot],
-  );
-
+  const noHighlight = useMemo(() => new Set<number>(), []);
   const inv = useMemo(() => Object.fromEntries(state.inventory.map((i) => [i.item, i.qty])), [state.inventory]);
 
-  const selectAnimal = useCallback(
-    async (a: Animal) => {
-      const { status } = animalStatus(a, Date.now());
-      if (status === "hungry") {
-        const feedItem = config?.animals[a.type]?.feedItem;
-        if (feedItem && (inv[feedItem] ?? 0) < (config?.animals[a.type]?.feedQty ?? 1)) {
-          toast(`Need ${emoji(feedItem)} ${config?.shop[feedItem]?.name ?? "feed"} — grab some at the market`, "info");
-          return onNeedFeed(a);
-        }
-        const r = await feed(a);
-        if (r) flashAnimal(a.id, "😋");
-      } else {
-        const r = await collect(a);
-        if (r) flashAnimal(a.id, `+${r.qty} ${emoji(r.item)}`);
-      }
+  const flash = <T,>(set: React.Dispatch<React.SetStateAction<Record<string, T>>>, id: string, v: T, ms: number) => {
+    set((m) => ({ ...m, [id]: v }));
+    setTimeout(() => set((m) => {
+      const n = { ...m };
+      delete n[id];
+      return n;
+    }), ms);
+  };
+
+  const onHarvest = useCallback(
+    async (plot: Plot) => {
+      const cropId = plot.crop_id ?? "";
+      const r = await harvest(plot);
+      if (r) flash(setHarvestFx, plot.id, { cropId, label: `+${r.qty} ${emoji(r.item)}`, at: Date.now() }, 1300);
     },
-    [collect, config, feed, inv, onNeedFeed, toast],
+    [harvest],
+  );
+
+  const hasFeedFor = (type: string) => {
+    const a = config?.animals[type];
+    return !!a && (inv[a.feedItem] ?? 0) >= a.feedQty;
+  };
+
+  const onFeed = useCallback(
+    async (a: Animal) => {
+      const cfg = config?.animals[a.type];
+      if (cfg && (inv[cfg.feedItem] ?? 0) < cfg.feedQty) {
+        toast(`Need ${emoji(cfg.feedItem)} ${config?.shop[cfg.feedItem]?.name ?? "feed"} — opening the market`, "info");
+        return onOpenPanel("shop");
+      }
+      const r = await feed(a);
+      if (r) flash<string>(setAnimalFx, a.id, "😋", 1200);
+    },
+    [config, feed, inv, onOpenPanel, toast],
+  );
+
+  const onCollect = useCallback(
+    async (a: Animal) => {
+      const r = await collect(a);
+      if (r) flash(setAnimalFx, a.id, `+${r.qty} ${emoji(r.item)}`, 1200);
+    },
+    [collect],
   );
 
   return (
     <>
-      <SoilTiles positions={positions} highlight={highlight} />
+      <SoilTiles positions={positions} highlight={noHighlight} />
       {state.plots.map((plot, i) => (
         <Plot3D
           key={plot.id}
@@ -136,9 +205,9 @@ function World({
           now={now}
           busy={!!busy[`plot:${plot.id}`]}
           fx={harvestFx[plot.id] ?? null}
-          hovered={hovered === plot.id}
-          onHover={(h) => setHovered((cur) => (h ? plot.id : cur === plot.id ? null : cur))}
-          onSelect={selectPlot}
+          cropName={plot.crop_id ? config?.crops[plot.crop_id]?.name : undefined}
+          onPlant={onEmptyPlot}
+          onHarvest={onHarvest}
           lowQuality={lowQuality}
         />
       ))}
@@ -151,108 +220,92 @@ function World({
           busy={!!busy[`animal:${a.id}`]}
           label={animalFx[a.id] ?? null}
           produce={config?.animals[a.type]?.produce}
-          onSelect={selectAnimal}
+          name={config?.animals[a.type]?.name ?? a.type}
+          hasFeed={hasFeedFor(a.type)}
+          onFeed={onFeed}
+          onCollect={onCollect}
         />
       ))}
+      <Stations onOpenPanel={onOpenPanel} />
     </>
   );
 }
 
 export default function FarmScene({
   state,
+  uiOpen,
   onEmptyPlot,
-  onNeedFeed,
+  onOpenPanel,
 }: {
   state: GameState;
+  uiOpen: boolean;
   onEmptyPlot: (plot: Plot) => void;
-  onNeedFeed: (animal: Animal) => void;
+  onOpenPanel: (t: PanelTab) => void;
 }) {
   const [lowQuality, setLowQuality] = useState(false);
   const [dpr, setDpr] = useState<[number, number]>([1, 2]);
-  // Desktop has a 400px HUD panel on the right: aim the camera right of the farm so it stays visible.
-  const [wide, setWide] = useState(false);
+  const [touch, setTouch] = useState(false);
 
   useEffect(() => {
+    setTouch(isTouchDevice());
     if (detectLowEnd()) {
       setLowQuality(true);
       setDpr([1, 1.5]);
     }
-    const mq = window.matchMedia("(min-width: 1024px)");
-    const onChange = () => setWide(mq.matches);
-    onChange();
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
   }, []);
-  const target = useMemo<[number, number, number]>(
-    () => (wide ? [CAMERA_TARGET[0] + 2.6, 0, CAMERA_TARGET[2]] : CAMERA_TARGET),
-    [wide],
-  );
 
-  const readyCount = state.plots.filter((p) => cropStage(p, Date.now()).stage === 2 && p.state !== "empty").length;
+  useEffect(() => {
+    useInteraction.getState().setUiOpen(uiOpen);
+  }, [uiOpen]);
 
   return (
-    <Canvas
-      flat
-      shadows={!lowQuality}
-      dpr={dpr}
-      camera={{ position: [0.4, 12, 15], fov: 40, near: 0.5, far: 120 }}
-      gl={{ antialias: !lowQuality, powerPreference: "high-performance" }}
-      onPointerMissed={() => document.body.style.removeProperty("cursor")}
-      aria-label={`Farm scene: ${state.plots.length} plots, ${readyCount} ready, ${state.animals.length} animals`}
-    >
-      {/* Drop quality automatically when the frame rate can't keep up. */}
-      <PerformanceMonitor
-        onDecline={() => {
-          setLowQuality(true);
-          setDpr([1, 1]);
-        }}
-        flipflops={2}
-      />
-      <AdaptiveDpr pixelated={false} />
+    <KeyboardControls map={KEYMAP}>
+      <InteractKey />
+      <Canvas
+        flat
+        shadows={!lowQuality}
+        dpr={dpr}
+        camera={{ fov: 50, near: 0.2, far: 140, position: [0, 6, 14] }}
+        gl={{ antialias: !lowQuality, powerPreference: "high-performance" }}
+        style={{ touchAction: "none" }}
+      >
+        {/* Drop quality automatically when the frame rate can't keep up. */}
+        <PerformanceMonitor
+          onDecline={() => {
+            setLowQuality(true);
+            setDpr([1, 1]);
+          }}
+          flipflops={2}
+        />
+        <AdaptiveDpr pixelated={false} />
 
-      <color attach="background" args={["#bfe6ff"]} />
-      <fog attach="fog" args={["#cdebf7", 24, 60]} />
-      <Sky sunPosition={[8, 6, 6]} turbidity={4} rayleigh={1.2} mieCoefficient={0.004} />
+        <color attach="background" args={["#bfe6ff"]} />
+        <fog attach="fog" args={["#cdebf7", 30, 75]} />
+        <Sky sunPosition={[8, 6, 6]} turbidity={4} rayleigh={1.2} mieCoefficient={0.004} />
+        <hemisphereLight args={["#fff6dc", "#7aa04a", 1.1]} />
+        <ambientLight intensity={0.25} />
 
-      <hemisphereLight args={["#fff6dc", "#7aa04a", 1.1]} />
-      <ambientLight intensity={0.25} />
-      <directionalLight
-        position={[8, 12, 6]}
-        intensity={1.8}
-        color="#fff1d6"
-        castShadow={!lowQuality}
-        shadow-mapSize-width={1024}
-        shadow-mapSize-height={1024}
-        shadow-camera-left={-13}
-        shadow-camera-right={13}
-        shadow-camera-top={13}
-        shadow-camera-bottom={-13}
-        shadow-camera-near={1}
-        shadow-camera-far={40}
-        shadow-bias={-0.0005}
-      />
-
-      <Suspense fallback={<LoadingOverlay />}>
-        <Scenery lowQuality={lowQuality} />
-        <World state={state} lowQuality={lowQuality} onEmptyPlot={onEmptyPlot} onNeedFeed={onNeedFeed} />
-      </Suspense>
-
-      <OrbitControls
-        makeDefault
-        target={target}
-        enablePan={false}
-        enableDamping
-        dampingFactor={0.08}
-        minDistance={7}
-        maxDistance={32}
-        minPolarAngle={0.5}
-        maxPolarAngle={1.12}
-        minAzimuthAngle={-1}
-        maxAzimuthAngle={1}
-        rotateSpeed={0.6}
-        zoomSpeed={0.8}
-      />
-      <CameraRig target={target} />
-    </Canvas>
+        <Suspense fallback={<LoadingOverlay />}>
+          {/* Fixed 60 Hz physics step, independent of render frame rate. */}
+          <Physics timeStep={1 / 60} gravity={[0, -9.81, 0]}>
+            <Scenery lowQuality={lowQuality} plotCount={state.plots.length} />
+            <World state={state} lowQuality={lowQuality} onEmptyPlot={onEmptyPlot} onOpenPanel={onOpenPanel} />
+            <Player disabled={uiOpen} lowQuality={lowQuality} />
+          </Physics>
+          <FocusResolver />
+        </Suspense>
+      </Canvas>
+      {touch && !uiOpen && (
+        <EcctrlJoystick
+          buttonNumber={0}
+          joystickPositionLeft={8}
+          joystickPositionBottom={78}
+          joystickHeightAndWidth={150}
+          joystickBaseProps={{ material: joyMaterials.base }}
+          joystickStickProps={{ material: joyMaterials.stick }}
+          joystickHandleProps={{ material: joyMaterials.handle }}
+        />
+      )}
+    </KeyboardControls>
   );
 }

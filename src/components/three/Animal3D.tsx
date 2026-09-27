@@ -1,20 +1,23 @@
 "use client";
 
 import { Html, useAnimations, useGLTF } from "@react-three/drei";
-import { useFrame, type ThreeEvent } from "@react-three/fiber";
+import { useFrame } from "@react-three/fiber";
+import { CapsuleCollider, RigidBody, type RapierRigidBody } from "@react-three/rapier";
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import type { Group, Object3D } from "three";
+import { Quaternion, Vector3, type Group, type Object3D } from "three";
 import { ANIMAL_MODELS, FALLBACK_ANIMAL, type ModelSpec } from "@/config/assets";
 import { animalStatus } from "@/lib/farmActions";
 import { emoji } from "@/lib/emoji";
-import { formatDuration } from "@/lib/game";
+import { formatDuration, serverNow } from "@/lib/game";
+import { player, useInteractable, useInteraction } from "@/lib/interaction";
 import type { Animal } from "@/lib/types";
 import { Procedural } from "./Procedural";
 import { PEN, rng } from "./layout";
 
-const CLICK_SLOP_PX = 8;
-
 type Motion = "walk" | "idle" | "eat";
+
+const UP = new Vector3(0, 1, 0);
+const tmpQ = new Quaternion();
 
 function hashId(id: string) {
   let h = 2166136261;
@@ -65,7 +68,10 @@ export function Animal3D({
   busy,
   label,
   produce,
-  onSelect,
+  name,
+  hasFeed,
+  onFeed,
+  onCollect,
 }: {
   animal: Animal;
   index: number;
@@ -73,26 +79,48 @@ export function Animal3D({
   busy: boolean;
   label: string | null;
   produce?: string;
-  onSelect: (a: Animal) => void;
+  name: string;
+  hasFeed: boolean;
+  onFeed: (a: Animal) => void;
+  onCollect: (a: Animal) => void;
 }) {
   const spec = ANIMAL_MODELS[animal.type] ?? FALLBACK_ANIMAL;
-  const { status, remaining } = animalStatus(animal, now);
-  const group = useRef<Group>(null);
+  const { status } = animalStatus(animal, now);
+  const rb = useRef<RapierRigidBody>(null);
   const bodyRef = useRef<Group>(null);
   const [motion, setMotion] = useState<Motion>("idle");
-  const [hovered, setHovered] = useState(false);
+  const id = `animal:${animal.id}`;
+  const focused = useInteraction((s) => s.focusId === id);
+  const produceEmoji = emoji(produce ?? (animal.type === "cow" ? "milk" : animal.type === "sheep" ? "wool" : "egg"));
 
   // Wander state lives in refs (no re-render per frame).
   const rand = useMemo(() => rng(hashId(animal.id)), [animal.id]);
-  const minX = PEN.x - PEN.w / 2 + spec.radius + 0.2;
-  const maxX = PEN.x + PEN.w / 2 - spec.radius - 0.2;
-  const minZ = PEN.z - PEN.d / 2 + spec.radius + 0.2;
-  const maxZ = PEN.z + PEN.d / 2 - spec.radius - 0.2;
+  const minX = PEN.x - PEN.w / 2 + spec.radius + 0.3;
+  const maxX = PEN.x + PEN.w / 2 - spec.radius - 0.3;
+  const minZ = PEN.z - PEN.d / 2 + spec.radius + 0.3;
+  const maxZ = PEN.z + PEN.d / 2 - spec.radius - 0.6;
   const pos = useRef<[number, number]>([minX + rand() * (maxX - minX), minZ + rand() * (maxZ - minZ)]);
   const target = useRef<[number, number]>([...pos.current]);
   const pauseUntil = useRef(index * 0.7);
   const heading = useRef(rand() * Math.PI * 2);
   const motionRef = useRef<Motion>("idle");
+
+  useInteractable(id, {
+    pos: () => pos.current,
+    radius: spec.radius + 1.4,
+    prompt: () => {
+      if (busy) return { icon: "⏳", label: "Working…", actionable: false };
+      const s = animalStatus(animal, serverNow());
+      if (s.status === "hungry") {
+        return hasFeed
+          ? { icon: "🥕", label: `Feed ${name}`, actionable: true }
+          : { icon: "🛒", label: `${name} is hungry — buy feed`, actionable: true };
+      }
+      if (s.status === "ready") return { icon: "🧺", label: `Collect ${produceEmoji}`, actionable: true };
+      return { icon: "⏳", label: `${produceEmoji} in ${formatDuration(s.remaining)}`, actionable: true };
+    },
+    act: () => (animalStatus(animal, serverNow()).status === "hungry" ? onFeed(animal) : onCollect(animal)),
+  });
 
   const setMotionOnce = (m: Motion) => {
     if (motionRef.current !== m) {
@@ -102,74 +130,62 @@ export function Animal3D({
   };
 
   useFrame((state, dt) => {
-    const g = group.current;
-    if (!g) return;
+    const body = rb.current;
+    if (!body) return;
     const t = state.clock.elapsedTime;
     const [x, z] = pos.current;
-    const [tx, tz] = target.current;
-    const dx = tx - x;
-    const dz = tz - z;
-    const dist = Math.hypot(dx, dz);
 
-    if (t < pauseUntil.current || hovered) {
+    if (focused) {
+      // Stop and look at the player while they're interacting.
       setMotionOnce(status === "hungry" ? "eat" : "idle");
-    } else if (dist < 0.05) {
-      // Arrived: rest a bit, then pick a new spot in the pen.
-      pauseUntil.current = t + 1.5 + rand() * 3.5;
-      target.current = [minX + rand() * (maxX - minX), minZ + rand() * (maxZ - minZ)];
+      const want = Math.atan2(player.x - x, player.z - z);
+      const diff = Math.atan2(Math.sin(want - heading.current), Math.cos(want - heading.current));
+      heading.current += diff * Math.min(1, dt * 5);
     } else {
-      setMotionOnce("walk");
-      const step = Math.min(dist, spec.walkSpeed * dt);
-      pos.current = [x + (dx / dist) * step, z + (dz / dist) * step];
-      const want = Math.atan2(dx, dz);
-      let diff = want - heading.current;
-      diff = Math.atan2(Math.sin(diff), Math.cos(diff));
-      heading.current += diff * Math.min(1, dt * 6);
+      const [tx, tz] = target.current;
+      const dx = tx - x;
+      const dz = tz - z;
+      const dist = Math.hypot(dx, dz);
+      if (t < pauseUntil.current) {
+        setMotionOnce(status === "hungry" ? "eat" : "idle");
+      } else if (dist < 0.05) {
+        pauseUntil.current = t + 1.5 + rand() * 3.5;
+        target.current = [minX + rand() * (maxX - minX), minZ + rand() * (maxZ - minZ)];
+      } else {
+        setMotionOnce("walk");
+        const step = Math.min(dist, spec.walkSpeed * dt);
+        pos.current = [x + (dx / dist) * step, z + (dz / dist) * step];
+        const want = Math.atan2(dx, dz);
+        const diff = Math.atan2(Math.sin(want - heading.current), Math.cos(want - heading.current));
+        heading.current += diff * Math.min(1, dt * 6);
+      }
     }
 
-    g.position.set(pos.current[0], 0, pos.current[1]);
-    g.rotation.y = heading.current;
-    // Procedural models have no clips: fake a little hop while walking.
+    body.setNextKinematicTranslation({ x: pos.current[0], y: 0, z: pos.current[1] });
+    tmpQ.setFromAxisAngle(UP, heading.current);
+    body.setNextKinematicRotation(tmpQ);
     if (bodyRef.current && !("url" in spec)) {
       bodyRef.current.position.y = motionRef.current === "walk" ? Math.abs(Math.sin(t * 9)) * 0.06 : 0;
     }
   });
 
-  const click = (e: ThreeEvent<MouseEvent>) => {
-    e.stopPropagation();
-    if (e.delta > CLICK_SLOP_PX || busy) return;
-    onSelect(animal);
-  };
-
   return (
-    <group ref={group}>
+    <RigidBody ref={rb} type="kinematicPosition" colliders={false} position={[pos.current[0], 0, pos.current[1]]}>
+      <CapsuleCollider args={[0.25, spec.radius * 0.8]} position={[0, 0.25 + spec.radius * 0.8, 0]} />
       <group ref={bodyRef}>
         <Suspense fallback={null}>
           <AnimalBody spec={spec} motion={motion} />
         </Suspense>
       </group>
 
-      <mesh
-        position={[0, 0.5, 0]}
-        onClick={click}
-        onPointerOver={(e) => {
-          e.stopPropagation();
-          setHovered(true);
-        }}
-        onPointerOut={() => setHovered(false)}
-      >
-        <boxGeometry args={[spec.radius * 2, 1.1, spec.radius * 2.2]} />
-        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
-      </mesh>
-
-      {hovered && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
-          <ringGeometry args={[spec.radius + 0.1, spec.radius + 0.2, 24]} />
-          <meshBasicMaterial color="#ffffff" transparent opacity={0.8} />
+      {focused && (
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.03, 0]}>
+          <ringGeometry args={[spec.radius + 0.1, spec.radius + 0.22, 24]} />
+          <meshBasicMaterial color="#ffffff" transparent opacity={0.9} />
         </mesh>
       )}
 
-      <Html position={[0, 1.35, 0]} center zIndexRange={[20, 0]} style={{ pointerEvents: "none" }}>
+      <Html position={[0, 1.45, 0]} center distanceFactor={10} zIndexRange={[20, 0]} style={{ pointerEvents: "none" }}>
         <div className="flex flex-col items-center gap-0.5">
           {label && (
             <div className="animate-float-up whitespace-nowrap font-display text-lg font-extrabold text-white drop-shadow-[0_2px_0_rgba(0,0,0,0.45)]">
@@ -177,25 +193,16 @@ export function Animal3D({
             </div>
           )}
           {status === "hungry" ? (
-            <div className="whitespace-nowrap rounded-full border-2 border-white bg-white/95 px-2 py-0.5 font-display text-[11px] font-extrabold text-grass-800 shadow-chunky-sm">
-              🥺 Feed me
+            <div className="whitespace-nowrap rounded-full border-2 border-white bg-white/95 px-2 py-0.5 font-display text-xs font-extrabold text-grass-800 shadow-chunky-sm">
+              🥺
             </div>
           ) : status === "ready" ? (
-            <div className="animate-wiggle whitespace-nowrap rounded-full border-2 border-white bg-sun-400 px-2 py-0.5 font-display text-xs font-extrabold text-soil-600 shadow-chunky-sm">
-              {emoji(produce ?? animalProduce(animal.type))} Collect!
+            <div className="animate-wiggle whitespace-nowrap rounded-full border-2 border-white bg-sun-400 px-2 py-0.5 font-display text-sm font-extrabold text-soil-600 shadow-chunky-sm">
+              {produceEmoji}!
             </div>
-          ) : (
-            <div className="whitespace-nowrap rounded-full bg-grass-900/70 px-2 py-0.5 font-display text-[11px] font-bold tabular-nums text-white">
-              {emoji(produce ?? animalProduce(animal.type))} {formatDuration(remaining)}
-            </div>
-          )}
+          ) : null}
         </div>
       </Html>
-    </group>
+    </RigidBody>
   );
-}
-
-// Fallback before config loads; the server config (passed as `produce`) is authoritative.
-function animalProduce(type: string) {
-  return type === "cow" ? "milk" : type === "sheep" ? "wool" : "egg";
 }

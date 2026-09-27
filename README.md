@@ -1,7 +1,8 @@
 # FarmZ Web 🌽
 
-The FarmZ game client: a cozy low‑poly **3D** farm sim (Harvest Moon / Stardew vibe) on **Base Sepolia**.
-Next.js 14 (App Router) · TypeScript · React Three Fiber + drei (three.js) · Tailwind · wagmi + viem + RainbowKit.
+The FarmZ game client: a cozy, **walkable low‑poly 3D farm RPG** (Harvest Moon / Stardew vibe) on **Base Sepolia**.
+Next.js 14 (App Router) · TypeScript · React Three Fiber + drei · Rapier physics + ecctrl character controller ·
+Tailwind · wagmi + viem + RainbowKit.
 
 Plant crops, raise animals, finish daily missions, trade at the market and (soon) claim FARMZ on‑chain.
 Every coin, item, timer and mission lives on the backend (Supabase edge functions); this app only
@@ -13,8 +14,9 @@ renders server state and names the action the player wants.
 | --- | --- | --- |
 | Wallet | RainbowKit connect, locked to Base Sepolia (84532) | — |
 | Sign‑in | SIWE (EIP‑4361): nonce → sign → verify → Supabase session JWT (auto‑refreshed) | `auth-nonce`, `auth-verify` |
-| 3D Farm | Low‑poly scene: raised soil plots (grid from `state`), crop models per growth stage, harvest burst, orbit camera | `state`, `plant`, `harvest` |
-| 3D Barnyard | Animated animals wander the pen; tap to feed / collect | `feed-animal`, `collect-produce` |
+| Open world | Walk your farmer around the farm (third‑person camera, physics collisions) | — |
+| Field | Walk up to a plot → plant / harvest; crop models per growth stage, harvest burst | `state`, `plant`, `harvest` |
+| Barnyard | Animated animals wander the pen; walk up to feed / collect | `feed-animal`, `collect-produce` |
 | Barn | Inventory from server state | `state` |
 | Missions | Daily board with progress bars + coin/FARMZ rewards (paid automatically by the server) | `state` |
 | Orders | Daily order board (counts toward `complete_order` missions) | `complete-order` |
@@ -29,26 +31,64 @@ Claim flow: `claim-request` returns `{ claimId, amountWei, nonce, deadline, sign
 `claim-confirm`. If the contract is `paused()`, the config has no signer, or the backend answers 503
 (`SIGNER_NOT_CONFIGURED`), the panel shows a friendly “Claim opening soon” badge instead of an error.
 
-## 3D scene
+## Controls
 
-- **Engine:** `@react-three/fiber` + `@react-three/drei`. The scene (`src/components/three/`) is loaded
-  lazily with `next/dynamic` (`ssr: false`), so the HUD paints first and three.js never runs on the server.
-- **Camera:** OrbitControls at a ~52° isometric‑ish angle. Pan is off, and zoom, tilt and rotation are
-  clamped so it stays playable with one thumb. `CameraRig` frames the farm for the screen: portrait
-  phones get a diagonal view (field in front, pen behind).
-- **Interaction:** taps raycast into the scene. An empty plot opens the crop picker → `POST /plant`.
-  A growing or ready plot → `POST /harvest` (the server answers `NOT_READY` if it isn't ready).
-  An animal → `POST /feed-animal` or `POST /collect-produce`. Drags aren't counted as taps.
-- **Server‑authoritative:** crop stage (seed → sprout → ripe) and countdowns are only derived from the
-  server's `planted_at` / `ready_at` for display. Coins, items and timers come only from the backend.
+| | Desktop | Mobile |
+| --- | --- | --- |
+| Move | **W A S D** / arrow keys | virtual joystick (bottom‑left) |
+| Run | hold **Shift** | push the joystick all the way |
+| Jump | **Space** | — |
+| Interact | **E** / Enter (or click the prompt) | big action button (bottom‑right) |
+| Camera | drag to orbit, mouse wheel to zoom | drag the screen |
+| Menus | 📋 🛒 👛 🧺 buttons (top‑right) | same (opens a bottom sheet; movement pauses) |
+
+## Walkable world
+
+- **Stack:**
+  - `@react-three/rapier@1.5` for physics, with a fixed 60 Hz step.
+  - `ecctrl@1.0.92` as the character controller: a floating capsule with a follow camera, keyboard
+    input and a mobile joystick.
+  - These are the last versions that support React 18 / fiber 8 (ecctrl ≥ 1.0.93 needs React 19).
+  - ecctrl is imported through the `ecctrl-lib` webpack alias with local types
+    (`src/types/ecctrl-lib.d.ts`), because the package's own `.d.ts` pulls raw `.tsx` sources into
+    our strict type‑check.
+  - `autoBalance` is off (upright capsule, only the model turns). ecctrl's balance spring blew up to
+    NaN at uneven frame rates in testing.
+- **Map:** about 38 × 38 m (`src/components/three/layout.ts`):
+  - the crop field (grid from `grid_size`, with walkways between plots)
+  - the barnyard pen, entered through the gate on its south side
+  - the barn + market stall, the mission board, the pond, and paths
+  - a ring of trees plus invisible walls at the edge
+- **Collision:**
+  - Colliders on the ground, map edge, barn, market stall, pen fences, mission board, pond and tree trunks.
+  - Animals are kinematic bodies, so you bump into them.
+  - Decoration (grass, flowers, bushes, rocks) has no colliders, to keep physics cheap.
+- **Interaction (proximity):**
+  - Plots, animals, the market and the mission board register with `src/lib/interaction.ts`.
+  - About 10×/s the nearest one in range becomes the focus: it gets a white ring in the world and an
+    `E · 🌱 Plant` prompt in the HUD.
+  - **E** or the action button runs its action, which is the same backend call as before:
+    - empty plot → crop picker → `POST /plant`
+    - growing or ready plot → `POST /harvest` (the server answers `NOT_READY` if it's early)
+    - hungry animal → `POST /feed-animal` (opens the Market if you have no feed)
+    - other animals → `POST /collect-produce`
+    - market stall → Market panel
+    - mission board → Missions panel
+- **Server‑authoritative:** crop stages and countdowns are derived from the server's `planted_at` /
+  `ready_at` for display only. Proximity only triggers UI, and the backend decides every result.
+- **HUD:**
+  - Minimap (top‑left) showing the player dot, field, pen, barn, market, board and pond.
+  - Menu buttons (top‑right): Missions, Market, Wallet/claim ("Claim opening soon" while claims are
+    paused) and Barn.
+  - The action prompt, and control hints on desktop.
 - **Performance:**
-  - Soil tiles and grass tufts are drawn with `<Instances>` (one draw call per kind).
-  - GLBs are shared with `<Clone>`, and every model is under 600 triangles.
-  - `dpr` is capped at `[1, 2]`, or `[1, 1.5]` on low‑end or touch devices, where shadows and part of
-    the scenery are also dropped.
-  - `PerformanceMonitor` lowers quality further if the frame rate falls, and `AdaptiveDpr` lowers
-    resolution while the camera moves.
-  - The shadow map is 1024².
+  - Soil tiles and grass are drawn with `<Instances>`, and GLBs are shared with `<Clone>`.
+  - Every model is under 750 triangles, and colliders are kept to what matters.
+  - `dpr` is capped at `[1, 2]`, or `[1, 1.5]` on low‑end or touch devices. Those devices also drop
+    shadows and part of the scenery.
+  - `PerformanceMonitor` lowers quality further if fps falls.
+  - The shadow‑casting sun follows the player (ecctrl `followLight`), so a small, sharp shadow
+    frustum covers the whole map.
 
 ## 3D assets (CC0)
 
@@ -61,6 +101,7 @@ change to swap art.
 | [Food Kit](https://kenney.nl/assets/food-kit) | ripe tomatoes and strawberries on the plants |
 | [Cube Pets](https://kenney.nl/assets/cube-pets) | cow and chicken (with idle / walk / eat animations) |
 | [Survival Kit](https://kenney.nl/assets/survival-kit) | barrel, crate, bucket, signpost |
+| [Mini Characters](https://kenney.nl/assets/mini-characters) | **player character** (`character-male-a`, `character-female-a` also included), skinned with idle / walk / sprint / jump / fall / pick‑up |
 
 The kits' license files are copied next to the models (`public/models/LICENSE-kenney-*.txt`). CC0
 means free for commercial use with no attribution required, but crediting Kenney is appreciated.
@@ -88,6 +129,23 @@ means free for commercial use with no attribution required, but crediting Kenney
    - `offset`: nudge, used to stack parts in composite crop stages.
 3. Animated animals: clips named `idle`, `walk` and `eat` are played automatically, and other names
    fall back to `idle`.
+
+### Swapping the player character
+
+`PLAYER_MODEL` in `src/config/assets.ts` holds the glb URL, the scale, the `y` feet offset and an
+`animations` map from controller states to clip names in the glb:
+
+```ts
+export const PLAYER_MODEL = {
+  url: "/models/characters/character-female-a.glb", // or e.g. a Quaternius character
+  scale: 1.9,
+  y: -0.95, // capsuleHalfHeight + capsuleRadius + floatHeight
+  animations: { idle: "idle", walk: "walk", run: "sprint", jump: "jump", jumpIdle: "fall", jumpLand: "idle", fall: "fall", action1: "pick-up" },
+};
+```
+
+For Quaternius "Ultimate Animated Character" the clips are named like `Idle`, `Walk` and `Run`.
+Update the map to match, and adjust `scale` so the character is about 1.3 units tall.
 
 Only use CC0 or properly licensed assets. Never use models ripped from commercial games.
 
@@ -159,13 +217,15 @@ src/
   config/assets.ts  game id -> model map (swap art here)
   app/            layout, providers (wagmi/RainbowKit/react-query), main page: 3D scene + HUD
   components/     Header, AuthGate, CropPicker, Inventory, Missions, Orders, Shop, ClaimPanel, Sheet, Toast
-  components/three/ FarmScene (Canvas, lights, controls), Plot3D, Animal3D, Scenery, Soil (instanced),
-                  Model (glb/procedural), Procedural placeholders, CameraRig, layout
+  components/three/ FarmScene (Canvas, physics, keyboard/joystick, interaction), Player (ecctrl),
+                  Plot3D, Animal3D, Scenery (world + colliders), Soil (instanced), Model, Procedural, layout
+  components/hud/ ActionPrompt (E prompt / mobile action button), Minimap
   lib/
     api.ts        edge-function fetch wrapper, token refresh, friendly error copy
     session.tsx   SIWE sign-in + session storage
     game.tsx      state/config queries, server-clock countdowns, action runner
     farmActions.ts plant/harvest/feed/collect + display-only crop/animal stage helpers
+    interaction.ts proximity registry, focus store, player position
     wagmi.ts      chain + wallet config
     abi.ts        FARMZ ERC-20 + FarmZClaim ABIs
     types.ts      backend response types

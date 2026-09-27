@@ -129,6 +129,28 @@ export const PROP_MODELS = {
   signpost: { url: "/models/survival/signpost.glb", scale: 2.4 } as ModelSpec,
 };
 
+/**
+ * Player character. Kenney "Mini Characters" (CC0): skinned, with idle/walk/sprint/jump/fall/pick-up
+ * clips. `animations` maps controller states -> clip names in the glb; swap both to change character
+ * (e.g. Quaternius "Ultimate Animated Character": idle -> "Idle", walk -> "Walk", run -> "Run").
+ */
+export const PLAYER_MODEL = {
+  url: "/models/characters/character-male-a.glb",
+  scale: 1.9,
+  /** Feet offset from the capsule centre (capsuleHalfHeight + capsuleRadius + floatHeight). */
+  y: -0.95,
+  animations: {
+    idle: "idle",
+    walk: "walk",
+    run: "sprint",
+    jump: "jump",
+    jumpIdle: "fall",
+    jumpLand: "idle",
+    fall: "fall",
+    action1: "pick-up",
+  },
+};
+
 /** Every glb referenced above — preloaded once the scene mounts. */
 export function allModelUrls(): string[] {
   const urls = new Set<string>();
@@ -136,5 +158,6 @@ export function allModelUrls(): string[] {
   Object.values(CROP_MODELS).forEach((c) => c.stages.flat().forEach(add));
   Object.values(ANIMAL_MODELS).forEach(add);
   Object.values(PROP_MODELS).forEach((p) => (Array.isArray(p) ? p.forEach(add) : add(p)));
+  urls.add(PLAYER_MODEL.url);
   return [...urls];
 }

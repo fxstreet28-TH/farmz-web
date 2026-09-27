@@ -1,17 +1,16 @@
 "use client";
 
 import { Html } from "@react-three/drei";
-import { useFrame, type ThreeEvent } from "@react-three/fiber";
+import { useFrame } from "@react-three/fiber";
 import { Suspense, useEffect, useRef, useState } from "react";
 import type { Group } from "three";
 import { CROP_MODELS, FALLBACK_CROP } from "@/config/assets";
 import { cropStage } from "@/lib/farmActions";
 import { emoji } from "@/lib/emoji";
-import { formatDuration } from "@/lib/game";
+import { formatDuration, serverNow } from "@/lib/game";
+import { useInteractable, useInteraction } from "@/lib/interaction";
 import type { Plot } from "@/lib/types";
 import { ModelStack } from "./Model";
-
-const CLICK_SLOP_PX = 8; // ignore clicks that were really camera drags
 
 export interface HarvestFx {
   cropId: string;
@@ -25,9 +24,9 @@ export function Plot3D({
   now,
   busy,
   fx,
-  hovered,
-  onHover,
-  onSelect,
+  cropName,
+  onPlant,
+  onHarvest,
   lowQuality,
 }: {
   plot: Plot;
@@ -35,17 +34,35 @@ export function Plot3D({
   now: number;
   busy: boolean;
   fx: HarvestFx | null;
-  hovered: boolean;
-  onHover: (h: boolean) => void;
-  onSelect: (plot: Plot) => void;
+  cropName?: string;
+  onPlant: (plot: Plot) => void;
+  onHarvest: (plot: Plot) => void;
   lowQuality: boolean;
 }) {
-  const { stage, remaining } = cropStage(plot, now);
+  const { stage } = cropStage(plot, now);
   const cropId = plot.crop_id;
   const specs = cropId ? (CROP_MODELS[cropId] ?? FALLBACK_CROP).stages[stage] : null;
   const cropRef = useRef<Group>(null);
   const grow = useRef(1);
   const stageKey = `${cropId}:${stage}`;
+  const id = `plot:${plot.id}`;
+  const focused = useInteraction((s) => s.focusId === id);
+  const ready = plot.state !== "empty" && stage === 2;
+
+  useInteractable(id, {
+    pos: () => [position[0], position[2]],
+    radius: 1.35,
+    prompt: () => {
+      if (busy) return { icon: "⏳", label: "Working…", actionable: false };
+      if (plot.state === "empty") return { icon: "🌱", label: "Plant", actionable: true };
+      const s = cropStage(plot, serverNow());
+      const name = cropName ?? plot.crop_id ?? "crop";
+      if (s.stage === 2) return { icon: "⛏️", label: `Harvest ${name}`, actionable: true };
+      // Still growing: the server decides; trying early just gets a friendly NOT_READY.
+      return { icon: "⏳", label: `${name} · ${formatDuration(s.remaining)}`, actionable: true };
+    },
+    act: () => (plot.state === "empty" ? onPlant(plot) : onHarvest(plot)),
+  });
 
   // Pop-in whenever the crop or its stage changes.
   useEffect(() => {
@@ -58,39 +75,15 @@ export function Plot3D({
     grow.current += (1 - grow.current) * Math.min(1, dt * 7);
     const bounce = 1 + Math.sin((1 - grow.current) * Math.PI) * 0.15;
     g.scale.setScalar(grow.current * bounce);
-    // Ready crops sway to invite a tap.
     g.rotation.z = stage === 2 ? Math.sin(state.clock.elapsedTime * 2.4 + position[0]) * 0.06 : 0;
   });
 
-  const click = (e: ThreeEvent<MouseEvent>) => {
-    e.stopPropagation();
-    if (e.delta > CLICK_SLOP_PX || busy) return;
-    onSelect(plot);
-  };
-
-  const ready = plot.state !== "empty" && stage === 2;
-
   return (
     <group position={position}>
-      {/* hit box covers soil + crop */}
-      <mesh
-        position={[0, 0.5, 0]}
-        onClick={click}
-        onPointerOver={(e) => {
-          e.stopPropagation();
-          onHover(true);
-        }}
-        onPointerOut={() => onHover(false)}
-      >
-        <boxGeometry args={[1.25, 1, 1.25]} />
-        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
-      </mesh>
-
-      {/* selection / ready ring */}
-      {(hovered || ready) && (
+      {(focused || ready) && (
         <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
-          <ringGeometry args={[0.78, 0.9, 24]} />
-          <meshBasicMaterial color={ready ? "#ffdd55" : "#ffffff"} transparent opacity={ready ? 0.9 : 0.7} />
+          <ringGeometry args={[0.8, focused ? 0.95 : 0.88, 28]} />
+          <meshBasicMaterial color={focused ? "#ffffff" : "#ffdd55"} transparent opacity={0.9} />
         </mesh>
       )}
 
@@ -104,23 +97,14 @@ export function Plot3D({
 
       {fx && <HarvestBurst key={fx.at} fx={fx} />}
 
-      <Html position={[0, stage === 2 ? 1.5 : 1.0, 0.25]} center zIndexRange={[20, 0]} style={{ pointerEvents: "none" }}>
-        {plot.state === "empty" ? (
-          hovered && !fx ? (
-            <div className="rounded-full bg-white/90 px-2 py-0.5 font-display text-xs font-extrabold text-grass-700 shadow-chunky-sm">
-              ＋ Plant
-            </div>
-          ) : null
-        ) : ready ? (
-          <div className="animate-wiggle whitespace-nowrap rounded-full border-2 border-white bg-sun-400 px-2 py-0.5 font-display text-xs font-extrabold text-soil-600 shadow-chunky-sm">
-            {emoji(cropId)} Harvest!
+      {/* Ready crops advertise themselves; details show in the HUD prompt when you walk up. */}
+      {ready && !focused && (
+        <Html position={[0, 1.5, 0]} center distanceFactor={10} zIndexRange={[20, 0]} style={{ pointerEvents: "none" }}>
+          <div className="animate-wiggle whitespace-nowrap rounded-full border-2 border-white bg-sun-400 px-2 py-0.5 font-display text-sm font-extrabold text-soil-600 shadow-chunky-sm">
+            {emoji(cropId)} Ready!
           </div>
-        ) : (
-          <div className="whitespace-nowrap rounded-full bg-grass-900/70 px-2 py-0.5 font-display text-[11px] font-bold tabular-nums text-white">
-            ⏱ {formatDuration(remaining)}
-          </div>
-        )}
-      </Html>
+        </Html>
+      )}
     </group>
   );
 }
